@@ -76,12 +76,17 @@ def label_map(cfg: dict) -> dict:
 
 def credential_kind() -> str:
     oauth, key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), os.environ.get("ANTHROPIC_API_KEY")
+    if os.environ.get("ISSUE_RUNNER_LOCAL"):
+        # Local loop: Claude Code's own login (Pro/Max), never the metered API.
+        if key:
+            raise SystemExit("ANTHROPIC_API_KEY is set; the local runner uses the Claude login only. Unset it.")
+        return "oauth"
     if oauth and key:
         raise SystemExit("both CLAUDE_CODE_OAUTH_TOKEN and ANTHROPIC_API_KEY are set; pick one")
     if key:
         return "api_key"
-    if oauth or os.environ.get("ISSUE_RUNNER_LOCAL"):
-        return "oauth"  # local loop: Claude Code's own login (Pro/Max)
+    if oauth:
+        return "oauth"
     return "none"
 
 
@@ -156,7 +161,13 @@ def report_body(plan: dict, results: list[dict] | None = None) -> str:
         lines.append("|---|---|---|---|---|---|")
         for i in plan["picked"]:
             r = by_number.get(i["number"], {})
-            cost = f"${r['usd']:.2f}" if r.get("usd") is not None else "-"
+            toks = r.get("tokens") or {}
+            if r.get("usd") is not None:
+                cost = f"${r['usd']:.2f}"
+            elif toks:
+                cost = f"{toks.get('output_tokens', 0) // 1000}k out / {(toks.get('cache_read_input_tokens', 0) + toks.get('input_tokens', 0)) // 1_000_000}M in"
+            else:
+                cost = "-"
             lines.append(f"| #{i['number']} | {i['title']} | {r.get('status', 'pending')} | "
                          f"{r.get('pr') or '-'} | {r.get('minutes', '-')} | {cost} |")
     else:
@@ -182,6 +193,9 @@ def report_body(plan: dict, results: list[dict] | None = None) -> str:
     totals = {
         "usd": round(sum(r.get("usd") or 0 for r in results), 4),
         "minutes": round(sum(r.get("minutes") or 0 for r in results), 1),
+        "output_tokens": sum((r.get("tokens") or {}).get("output_tokens", 0) for r in results),
+        "input_tokens": sum((r.get("tokens") or {}).get(k, 0) for r in results
+                            for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")),
     }
     data = {
         "run_id": plan["run_id"], "repo": plan["repo"], "started_at": plan["started_at"],

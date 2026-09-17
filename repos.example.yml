@@ -13,5 +13,6 @@ repos:
       stale_days: 7
       models: {triage: claude-sonnet-5, implement: claude-opus-5}
       budget: {hours_month: 25}
+      show_api_equivalent: false       # true adds a "what this would cost on the API" figure; never a bill
       base_branch: develop
       # allowed_tools: [...]       # override the loop's default allow-list for claude -p

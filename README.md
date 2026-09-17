@@ -29,8 +29,10 @@ Each Claude session runs `claude -p` in a throwaway git worktree under `~/.issue
 never in the admin's checkout, with the tool allow-list from the config. Logs per Run in
 `~/Library/Logs/issue-runner/<stamp>/`, one JSON per session with `total_cost_usd` and usage.
 
-Credential is whatever `claude` is logged in with (Pro/Max). To meter by dollars instead, export
-`ANTHROPIC_API_KEY` in the launchd environment and set `budget: {usd_month: N}`.
+Credential is the Claude Code login (Pro/Max), and only that: the loop strips `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` from every session's environment and refuses to start if a key is exported.
+Reports show tokens and minutes; the hours budget is the gate. `show_api_equivalent: true` adds an
+informational list-price figure computed from the transcript, never a charge.
 
 ## Onboard a repo on GitHub Actions (secondary)
 
@@ -50,8 +52,7 @@ One session is capped by size label (`minutes_by_size`, default 45). The prompt 
 for a draft PR before it. A session killed at the cap with a PR open is a **continuation**: the issue
 gets `agent:continue`, and the next Run resumes that branch first in the pick order, in a fresh session
 reading the PR's "what is left". After `max_continuations` the issue goes `ready-for-human` with the WIP
-PR attached. Cost for a killed session is summed from Claude Code's transcript at API list prices and
-marked `transcript_estimate`.
+PR attached. Tokens for a killed session are summed from Claude Code's transcript.
 
 ## Admin verbs
 

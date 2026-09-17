@@ -59,9 +59,11 @@ def claude_session(prompt: str, model: str, cwd: Path, minutes: int, claude_bin:
     (total_cost_usd, usage, duration_ms, is_error) or a synthetic error dict."""
     cmd = [claude_bin, "-p", prompt, "--model", model, "--output-format", "json",
            "--allowedTools", ",".join(allowed_tools)]
+    # Subscription only: an exported API key must never reach the session.
+    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     started = time.time()
     try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=minutes * 60)
+        proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=minutes * 60)
         log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
         try:
             data = json.loads(proc.stdout)
@@ -73,6 +75,16 @@ def claude_session(prompt: str, model: str, cwd: Path, minutes: int, claude_bin:
         data = {"is_error": True, "timed_out": True, "result": f"killed after {minutes} min"}
     data["minutes"] = round((time.time() - started) / 60, 1)
     return data
+
+
+def record_usage(data: dict, wt: Path, started: float, cfg: dict) -> None:
+    """Tokens always; a dollar figure only when the admin asks for the API equivalent."""
+    show = bool(cfg.get("show_api_equivalent", False))
+    if not data.get("usage"):
+        data.update(usage_from_transcripts(str(wt), since=started, price=show))
+    if not show:
+        data["total_cost_usd"] = None
+        data["cost_source"] = "subscription"
 
 
 def worktree(repo_path: Path, number: int, base_branch: str, branch: str | None = None) -> Path:
@@ -119,8 +131,7 @@ def run_repo(entry: dict, global_cfg: dict, quota_override: str | None, run_dir:
             started = time.time()
             data = claude_session(render_prompt("triage.md", repo=slug), cfg["models"]["triage"], wt,
                                   cfg.get("triage_minutes", 20), claude_bin, allowed, run_dir / f"{name}-triage.log")
-            if data.get("total_cost_usd") is None:
-                data.update(usage_from_transcripts(str(wt), since=started))
+            record_usage(data, wt, started, cfg)
             (results_dir / "triage").mkdir(exist_ok=True)
             moves = wt / "triage-moves.json"
             if moves.exists():
@@ -145,8 +156,7 @@ def run_repo(entry: dict, global_cfg: dict, quota_override: str | None, run_dir:
             started = time.time()
             data = claude_session(prompt, cfg["models"]["implement"], wt, minutes, claude_bin, allowed,
                                   run_dir / f"{name}-issue-{n}.log")
-            if data.get("total_cost_usd") is None:
-                data.update(usage_from_transcripts(str(wt), since=started))
+            record_usage(data, wt, started, cfg)
             session_file = run_dir / f"{name}-issue-{n}.json"
             session_file.write_text(json.dumps(data))
             args = ["result", "--repo", slug, "--number", str(n), "--execution-file", str(session_file),

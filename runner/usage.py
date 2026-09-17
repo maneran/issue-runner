@@ -25,7 +25,10 @@ def project_dir_name(cwd: str) -> str:
     return cwd.replace("/", "-").replace(".", "-")
 
 
-def usage_from_transcripts(cwd: str, since: float, projects_dir: Path | None = None) -> dict:
+def usage_from_transcripts(cwd: str, since: float, projects_dir: Path | None = None,
+                           price: bool = True) -> dict:
+    """Token totals for the session in `cwd` since `since`. With `price=False`
+    (subscription runs) no dollar figure is produced: tokens and minutes are the cost."""
     projects_dir = projects_dir or (Path.home() / ".claude" / "projects")
     root = projects_dir / project_dir_name(cwd)
     usage = {k: 0 for k in KEYS}
@@ -49,4 +52,6 @@ def usage_from_transcripts(cwd: str, since: float, projects_dir: Path | None = N
                     n = int(u.get(k, 0) or 0)
                     usage[k] += n
                     cost += n * p / 1e6
+    if not price:
+        return {"usage": usage, "total_cost_usd": None, "cost_source": "subscription"}
     return {"usage": usage, "total_cost_usd": round(cost, 4), "cost_source": "transcript_estimate"}

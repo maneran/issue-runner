@@ -78,7 +78,7 @@ def test_report_json_roundtrip():
     }
     body = report_body(plan, [{"number": 7, "status": "pr_opened", "usd": 1.5, "minutes": 20}])
     data = parse_report_json(body)
-    assert data["totals"] == {"usd": 1.5, "minutes": 20}
+    assert data["totals"]["usd"] == 1.5 and data["totals"]["minutes"] == 20
     assert data["picked"] == [7]
 
 
@@ -141,3 +141,26 @@ def test_usage_from_transcripts_prices_and_sums(tmp_path):
     assert out["usage"] == {"input_tokens": 1000000, "output_tokens": 1000000, "cache_read_input_tokens": 1000000, "cache_creation_input_tokens": 0}
     assert out["total_cost_usd"] == 5 + 25 + 0.5
     assert out["cost_source"] == "transcript_estimate"
+
+
+def test_usage_unpriced_on_subscription(tmp_path):
+    from runner.usage import usage_from_transcripts
+
+    proj = tmp_path / "-Users-me-wt-5"
+    proj.mkdir()
+    (proj / "s.jsonl").write_text(json.dumps({"message": {"model": "claude-opus-5", "usage": {"output_tokens": 10}}}))
+    out = usage_from_transcripts("/Users/me/wt/5", since=0, projects_dir=tmp_path, price=False)
+    assert out["total_cost_usd"] is None and out["cost_source"] == "subscription"
+    assert out["usage"]["output_tokens"] == 10
+
+
+def test_local_mode_refuses_api_key(monkeypatch):
+    from runner.cli import credential_kind
+
+    monkeypatch.setenv("ISSUE_RUNNER_LOCAL", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-x")
+    import pytest
+    with pytest.raises(SystemExit):
+        credential_kind()
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    assert credential_kind() == "oauth"
