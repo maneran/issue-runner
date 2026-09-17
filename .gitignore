@@ -4,3 +4,4 @@ __pycache__/
 plan.json
 result-*.json
 .pytest_cache/
+repos.yml

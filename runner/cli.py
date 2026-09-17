@@ -45,7 +45,11 @@ def gh_json(*args: str):
 # --- config -----------------------------------------------------------------
 
 def load_config(path: str, quota_override: str | None) -> dict:
-    cfg = yaml.safe_load(Path(path).read_text()) or {}
+    return apply_defaults(yaml.safe_load(Path(path).read_text()) or {}, quota_override)
+
+
+def apply_defaults(cfg: dict, quota_override: str | None = None) -> dict:
+    cfg = dict(cfg)
     cfg.setdefault("stages", [])
     cfg.setdefault("quota", 0)
     cfg.setdefault("per_issue_minutes", 30)
@@ -71,21 +75,21 @@ def credential_kind() -> str:
     oauth, key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), os.environ.get("ANTHROPIC_API_KEY")
     if oauth and key:
         raise SystemExit("both CLAUDE_CODE_OAUTH_TOKEN and ANTHROPIC_API_KEY are set; pick one")
-    if oauth:
-        return "oauth"
     if key:
         return "api_key"
+    if oauth or os.environ.get("ISSUE_RUNNER_LOCAL"):
+        return "oauth"  # local loop: Claude Code's own login (Pro/Max)
     return "none"
 
 
 # --- step 0: labels -----------------------------------------------------------
 
-def sync_labels(cfg: dict) -> None:
+def sync_labels(repo: str, cfg: dict) -> None:
     canon = yaml.safe_load((HERE / "labels.yml").read_text())
     rename = cfg["labels"]
     for group in canon.values():
         for name, spec in group.items():
-            gh("label", "create", rename.get(name, name), "--force",
+            gh("label", "create", rename.get(name, name), "--repo", repo, "--force",
                "--color", spec["color"], "--description", spec["description"])
 
 
@@ -219,10 +223,13 @@ def set_output(name: str, value: str) -> None:
 def cmd_plan(args: argparse.Namespace) -> None:
     now = datetime.now(timezone.utc)
     repo = args.repo
-    cfg = load_config(args.config, args.quota)
+    if args.config_json:
+        cfg = apply_defaults(json.loads(args.config_json), args.quota)
+    else:
+        cfg = load_config(args.config, args.quota)
     labels = label_map(cfg)
     kind = credential_kind()
-    sync_labels(cfg)
+    sync_labels(repo, cfg)
 
     issues = list_open_issues(repo)
     for i in issues:
@@ -333,6 +340,7 @@ def main(argv: list[str] | None = None) -> None:
     a = sub.add_parser("plan")
     a.add_argument("--repo", required=True)
     a.add_argument("--config", default=".github/issue-runner.yml")
+    a.add_argument("--config-json", default=None, help="inline config (used by the local loop)")
     a.add_argument("--quota", default=None, help="override config quota")
     a.add_argument("--out", default="plan.json")
     a.set_defaults(fn=cmd_plan)

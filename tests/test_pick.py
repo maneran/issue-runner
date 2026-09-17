@@ -79,3 +79,13 @@ def test_report_json_roundtrip():
     data = parse_report_json(body)
     assert data["totals"] == {"usd": 1.5, "minutes": 20}
     assert data["picked"] == [7]
+
+
+def test_cost_from_claude_p_json(tmp_path):
+    from runner.cli import cost_from_execution_file
+
+    f = tmp_path / "s.json"
+    f.write_text('{"total_cost_usd": 1.25, "usage": {"input_tokens": 10, "output_tokens": 5, '
+                 '"cache_read_input_tokens": 100}, "result": "done"}')
+    cost = cost_from_execution_file(str(f))
+    assert cost == {"total_cost_usd": 1.25, "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100}

@@ -1,8 +1,10 @@
 # issue-runner
 
-Daily GitHub issue triage and implementation with Claude Code, human in the loop. One public repo of
-tooling; each target repo adds a 20-line caller workflow and a config file. GitHub is the only state
-store (see `docs/adr/0001`). Vocabulary: `CONTEXT.md`.
+Daily GitHub issue triage and implementation with Claude Code, human in the loop. Runs locally on the
+admin's Mac under their own Claude Code login (launchd, one control file `repos.yml`). GitHub is the
+only state store (see `docs/adr/0001`). Vocabulary: `CONTEXT.md`. A GitHub Actions variant exists
+(`.github/workflows/run.yml`, `examples/`) for repos whose tests can run on a hosted runner; it is
+secondary and untested past quota 0.
 
 ## What a Run does
 
@@ -14,7 +16,23 @@ store (see `docs/adr/0001`). Vocabulary: `CONTEXT.md`.
    ends in a draft PR or a written blocker.
 4. **Report**: fill the Run Report with results, PRs, minutes and cost; close it.
 
-## Onboard a repo
+## Local setup (primary)
+
+```
+python3 -m venv .venv && .venv/bin/pip install pytest pyyaml
+cp repos.example.yml repos.yml          # add repos, set schedule, stages, quota, budget
+PYTHONPATH=. .venv/bin/python -m runner.loop --quota 0     # smoke: labels + empty Run Report
+scripts/install-launchd.sh              # daily job at repos.yml schedule; prints run-now/remove
+```
+
+Each Claude session runs `claude -p` in a throwaway git worktree under `~/.issue-runner/worktrees`,
+never in the admin's checkout, with the tool allow-list from the config. Logs per Run in
+`~/Library/Logs/issue-runner/<stamp>/`, one JSON per session with `total_cost_usd` and usage.
+
+Credential is whatever `claude` is logged in with (Pro/Max). To meter by dollars instead, export
+`ANTHROPIC_API_KEY` in the launchd environment and set `budget: {usd_month: N}`.
+
+## Onboard a repo on GitHub Actions (secondary)
 
 1. Copy `examples/caller.yml` to `.github/workflows/issue-runner.yml` and set the cron.
 2. Copy `examples/issue-runner.yml` to `.github/issue-runner.yml` and set quota, stages, budget.
@@ -31,20 +49,16 @@ store (see `docs/adr/0001`). Vocabulary: `CONTEXT.md`.
 Merge is always yours. On an issue: `agent:skip` (ignore), `agent:retry` (redo from scratch),
 `agent:hold` (keep the PR, stay quiet). On a PR: mention `@claude` with what to change.
 
-## Local
+## Tests
 
-```
-python3 -m venv .venv && .venv/bin/pip install pytest pyyaml
-.venv/bin/pytest
-GH_TOKEN=... PYTHONPATH=. .venv/bin/python -m runner.cli plan --repo owner/name --config path/to/issue-runner.yml --quota 0
-```
+`.venv/bin/pytest`
 
 ## Not built yet
 
 - `agent:retry` handler (close PR, delete branch, clear in-flight) and the `pull_request: closed`
   hook that clears `agent:in-flight`.
 - Flip draft PR to ready when CI is green.
-- `@claude` mention workflow (claude-code-action's default `issue_comment` trigger; add as a second
-  caller workflow).
+- Free-text follow-ups on a PR: locally this needs a verb (`agent:revise`) the next Run acts on, or
+  the `@claude` mention workflow on Actions.
 - Dashboard (static SPA on GitHub Pages).
 - Verify `claude-code-action@v1` input names and the execution-file schema on first real run.

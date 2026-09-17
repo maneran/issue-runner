@@ -1,0 +1,15 @@
+# Copy to repos.yml (gitignored). The admin's control file for the local runner.
+schedule: {hour: 6, minute: 0}     # local time; scripts/install-launchd.sh reads it
+claude_bin: claude                 # Claude Code CLI; runs under your own login (Pro/Max)
+repos:
+  - path: ~/Development/wp-content-agent
+    config:                        # same keys as examples/issue-runner.yml
+      stages: []                   # [] = plan and report only; [triage, implement] = full Run
+      quota: 0
+      per_issue_minutes: 30
+      triage_minutes: 20
+      stale_days: 7
+      models: {triage: claude-sonnet-5, implement: claude-opus-5}
+      budget: {hours_month: 25}
+      base_branch: develop
+      # allowed_tools: [...]       # override the loop's default allow-list for claude -p
