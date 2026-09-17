@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from runner.pick import ReportTotals, budget_used, select_picks
+from runner.pick import ReportTotals, budget_used, continuation_count, minutes_for, select_picks
 
 HERE = Path(__file__).resolve().parent.parent
 JSON_MARK = "<!-- issue-runner:json -->"
@@ -26,7 +26,8 @@ JSON_MARK = "<!-- issue-runner:json -->"
 CANONICAL_KEYS = {
     "ready": "ready-for-agent", "skip": "agent:skip", "hold": "agent:hold",
     "in_flight": "agent:in-flight", "bug": "bug", "report": "agent-run",
-    "needs_triage": "needs-triage",
+    "needs_triage": "needs-triage", "cont": "agent:continue", "retry": "agent:retry",
+    "human": "ready-for-human",
 }
 
 
@@ -58,6 +59,8 @@ def apply_defaults(cfg: dict, quota_override: str | None = None) -> dict:
     cfg.setdefault("budget", {})
     cfg.setdefault("base_branch", "main")
     cfg.setdefault("labels", {})
+    cfg.setdefault("minutes_by_size", {"S": 20, "M": 45, "default": cfg["per_issue_minutes"]})
+    cfg.setdefault("max_continuations", 3)
     if quota_override not in (None, ""):
         cfg["quota"] = int(quota_override)
     return cfg
@@ -114,7 +117,8 @@ def previous_reports(repo: str, labels: dict) -> list[dict]:
     for i in issues:
         data = parse_report_json(i.get("body") or "")
         if data:
-            reports.append({"createdAt": i["createdAt"], "totals": data.get("totals", {})})
+            reports.append({"createdAt": i["createdAt"], "totals": data.get("totals", {}),
+                            "results": data.get("results", [])})
     return reports
 
 
@@ -232,10 +236,13 @@ def cmd_plan(args: argparse.Namespace) -> None:
     sync_labels(repo, cfg)
 
     issues = list_open_issues(repo)
+    reports = previous_reports(repo, labels)
+    handoffs = reconcile_verbs(repo, issues, labels, reports, cfg["max_continuations"])
     for i in issues:
         names = {l["name"] for l in i["labels"]}
         i["blocked_by"] = blocked_count(repo, i["number"]) if labels["ready"] in names else 0
     picked, skipped = select_picks(issues, cfg["quota"], labels)
+    skipped.extend(handoffs)
 
     gate = None
     if "implement" not in cfg["stages"]:
@@ -243,10 +250,15 @@ def cmd_plan(args: argparse.Namespace) -> None:
     elif kind == "none" and cfg["quota"] > 0:
         gate = "no credential secret set"
     else:
-        gate = budget_gate(cfg, kind, budget_used(previous_reports(repo, labels), now))
+        gate = budget_gate(cfg, kind, budget_used(reports, now))
     if gate:
         skipped.extend((i["number"], gate) for i in picked)
         picked = []
+    for i in picked:
+        names = {l["name"] for l in i["labels"]}
+        i["minutes"] = minutes_for(i, cfg["minutes_by_size"])
+        i["continue"] = labels["cont"] in names
+        i["pr"] = agent_pr(repo, i["number"]) if i["continue"] else None
 
     plan = {
         "run_id": os.environ.get("GITHUB_RUN_ID", now.strftime("local-%Y%m%d%H%M%S")),
@@ -261,7 +273,8 @@ def cmd_plan(args: argparse.Namespace) -> None:
         gh("issue", "edit", "--repo", repo, str(i["number"]), "--add-label", labels["in_flight"])
 
     Path(args.out).write_text(json.dumps(plan, indent=2))
-    matrix = [{"number": i["number"], "title": i["title"], "url": i["url"]} for i in picked]
+    matrix = [{"number": i["number"], "title": i["title"], "url": i["url"], "minutes": i["minutes"],
+               "continue": i["continue"], "pr": i["pr"]} for i in picked]
     set_output("picks", json.dumps(matrix))
     set_output("count", str(len(matrix)))
     set_output("report_number", str(plan["report_number"]))
@@ -270,6 +283,53 @@ def cmd_plan(args: argparse.Namespace) -> None:
     set_output("model_triage", cfg["models"]["triage"])
     set_output("model_implement", cfg["models"]["implement"])
     set_output("base_branch", cfg["base_branch"])
+
+
+def agent_pr(repo: str, number: int, state: str = "open") -> dict | None:
+    prs = gh_json("pr", "list", "--repo", repo, "--state", state, "--limit", "5",
+                  "--search", f"head:agent/{number}-", "--json", "number,url,isDraft,headRefName")
+    return prs[0] if prs else None
+
+
+def reconcile_verbs(repo: str, issues: list[dict], labels: dict, reports: list[dict],
+                    max_continuations: int) -> list[tuple[int, str]]:
+    """Act on human verbs and stale runner labels before picking. Mutates `issues`
+    labels in place so the pick logic sees the new state. Returns hand-offs to
+    list under Skipped."""
+    handoffs: list[tuple[int, str]] = []
+    for i in issues:
+        names = {l["name"] for l in i["labels"]}
+        n = i["number"]
+
+        if labels["retry"] in names:
+            pr = agent_pr(repo, n)
+            if pr:
+                gh("pr", "close", "--repo", repo, str(pr["number"]), "--delete-branch",
+                   "--comment", "> *issue-runner:* closed on `agent:retry`; the next Run starts over.")
+            for lab in (labels["retry"], labels["in_flight"], labels["cont"]):
+                if lab in names:
+                    gh("issue", "edit", "--repo", repo, str(n), "--remove-label", lab)
+                    names.discard(lab)
+
+        elif labels["in_flight"] in names and not agent_pr(repo, n):
+            # The PR was merged or closed by a human; the runner label is stale.
+            for lab in (labels["in_flight"], labels["cont"]):
+                if lab in names:
+                    gh("issue", "edit", "--repo", repo, str(n), "--remove-label", lab)
+                    names.discard(lab)
+
+        if labels["cont"] in names and continuation_count(reports, n) >= max_continuations:
+            gh("issue", "comment", "--repo", repo, str(n), "--body",
+               f"> *This was generated by AI during implementation.*\n\nThe agent hit its time cap "
+               f"{max_continuations} times on this issue. Handing it to a human; the WIP draft PR stays open.")
+            gh("issue", "edit", "--repo", repo, str(n), "--remove-label", labels["cont"],
+               "--remove-label", labels["ready"], "--add-label", labels["human"])
+            names -= {labels["cont"], labels["ready"]}
+            names.add(labels["human"])
+            handoffs.append((n, f"handed to human after {max_continuations} continuations"))
+
+        i["labels"] = [{"name": x} for x in names]
+    return handoffs
 
 
 def cost_from_execution_file(path: str | None) -> dict:
@@ -290,9 +350,12 @@ def cost_from_execution_file(path: str | None) -> dict:
                 walk(v)
 
     try:
-        walk(json.loads(Path(path).read_text()))
+        data = json.loads(Path(path).read_text())
     except json.JSONDecodeError:
-        pass
+        return found
+    walk(data)
+    if isinstance(data, dict) and data.get("cost_source"):
+        found["cost_source"] = data["cost_source"]
     return found
 
 
@@ -303,14 +366,26 @@ def cmd_result(args: argparse.Namespace) -> None:
                   "--search", f"head:agent/{number}-", "--json", "number,url,isDraft")
     cost = cost_from_execution_file(args.execution_file)
     minutes = float(args.minutes) if args.minutes else None
+    if prs and args.timed_out:
+        status = "continued"
+    elif prs:
+        status = "pr_opened"
+    else:
+        status = "gave_up" if args.exit_code == "0" else "failed"
     result = {
-        "number": number, "status": "pr_opened" if prs else ("gave_up" if args.exit_code == "0" else "failed"),
+        "number": number, "status": status,
         "pr": prs[0]["url"] if prs else None, "minutes": minutes,
-        "usd": cost.get("total_cost_usd"), "tokens": {k: v for k, v in cost.items() if k != "total_cost_usd"},
+        "usd": cost.get("total_cost_usd"), "cost_source": cost.get("cost_source", "session"),
+        "tokens": {k: v for k, v in cost.items() if k not in ("total_cost_usd", "cost_source")},
     }
-    if not prs:
+    if status == "continued":
+        gh("issue", "edit", "--repo", args.repo, str(number), "--add-label", args.continue_label)
+    elif prs:
+        gh("issue", "edit", "--repo", args.repo, str(number), "--remove-label", args.continue_label)
+    else:
         # Nothing in flight: let the next Run pick it again unless a human labels otherwise.
-        gh("issue", "edit", "--repo", args.repo, str(number), "--remove-label", args.in_flight_label)
+        gh("issue", "edit", "--repo", args.repo, str(number), "--remove-label", args.in_flight_label,
+           "--remove-label", args.continue_label)
     Path(args.out).write_text(json.dumps(result, indent=2))
     print(json.dumps(result))
 
@@ -352,6 +427,8 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--minutes", default=None)
     r.add_argument("--exit-code", default="0")
     r.add_argument("--in-flight-label", default="agent:in-flight")
+    r.add_argument("--continue-label", default="agent:continue")
+    r.add_argument("--timed-out", action="store_true")
     r.add_argument("--out", required=True)
     r.set_defaults(fn=cmd_result)
 

@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 from runner.pick import select_picks, budget_used, ReportTotals
@@ -89,3 +90,54 @@ def test_cost_from_claude_p_json(tmp_path):
                  '"cache_read_input_tokens": 100}, "result": "done"}')
     cost = cost_from_execution_file(str(f))
     assert cost == {"total_cost_usd": 1.25, "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100}
+
+
+def test_continue_first_and_in_flight_without_continue_is_skipped():
+    labels = dict(LABELS, cont="agent:continue")
+    issues = [
+        issue(1, ["ready-for-agent", "P0"]),
+        issue(2, ["ready-for-agent", "agent:in-flight", "agent:continue"], created="2026-02-01T00:00:00Z"),
+        issue(3, ["ready-for-agent", "agent:in-flight"]),
+    ]
+    picked, skipped = select_picks(issues, quota=5, labels=labels)
+    assert [i["number"] for i in picked] == [2, 1]
+    assert dict(skipped) == {3: "agent:in-flight"}
+
+
+def test_continuation_count_from_previous_reports():
+    from runner.pick import continuation_count
+
+    reports = [
+        {"createdAt": "2026-09-01T06:00:00Z", "results": [{"number": 97, "status": "continued"}]},
+        {"createdAt": "2026-09-02T06:00:00Z", "results": [{"number": 97, "status": "continued"}, {"number": 5, "status": "continued"}]},
+        {"createdAt": "2026-09-03T06:00:00Z", "results": [{"number": 97, "status": "pr_opened"}]},
+    ]
+    assert continuation_count(reports, 97) == 2
+    assert continuation_count(reports, 5) == 1
+    assert continuation_count(reports, 6) == 0
+
+
+def test_minutes_for_issue_by_size():
+    from runner.pick import minutes_for
+
+    caps = {"S": 20, "M": 45, "default": 45}
+    assert minutes_for(issue(1, ["size:S"]), caps) == 20
+    assert minutes_for(issue(1, ["size:M"]), caps) == 45
+    assert minutes_for(issue(1, []), caps) == 45
+
+
+def test_usage_from_transcripts_prices_and_sums(tmp_path):
+    from runner.usage import usage_from_transcripts
+
+    proj = tmp_path / "-Users-me-wt-97"
+    proj.mkdir()
+    lines = [
+        {"message": {"model": "claude-opus-5", "usage": {"input_tokens": 1000000, "output_tokens": 0}}},
+        {"message": {"model": "claude-opus-5", "usage": {"cache_read_input_tokens": 1000000, "output_tokens": 1000000}}},
+        {"type": "user", "message": {"role": "user", "content": "no usage here"}},
+    ]
+    (proj / "s.jsonl").write_text("\n".join(json.dumps(l) for l in lines))
+    out = usage_from_transcripts("/Users/me/wt/97", since=0, projects_dir=tmp_path)
+    assert out["usage"] == {"input_tokens": 1000000, "output_tokens": 1000000, "cache_read_input_tokens": 1000000, "cache_creation_input_tokens": 0}
+    assert out["total_cost_usd"] == 5 + 25 + 0.5
+    assert out["cost_source"] == "transcript_estimate"

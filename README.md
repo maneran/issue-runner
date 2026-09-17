@@ -44,6 +44,15 @@ Credential is whatever `claude` is logged in with (Pro/Max). To meter by dollars
    trigger workflows).
 5. `gh workflow run issue-runner -f quota=0` opens a Run Report with zero picks. That is the smoke test.
 
+## Time caps and continuation
+
+One session is capped by size label (`minutes_by_size`, default 45). The prompt states the cap and asks
+for a draft PR before it. A session killed at the cap with a PR open is a **continuation**: the issue
+gets `agent:continue`, and the next Run resumes that branch first in the pick order, in a fresh session
+reading the PR's "what is left". After `max_continuations` the issue goes `ready-for-human` with the WIP
+PR attached. Cost for a killed session is summed from Claude Code's transcript at API list prices and
+marked `transcript_estimate`.
+
 ## Admin verbs
 
 Merge is always yours. On an issue: `agent:skip` (ignore), `agent:retry` (redo from scratch),
@@ -55,8 +64,6 @@ Merge is always yours. On an issue: `agent:skip` (ignore), `agent:retry` (redo f
 
 ## Not built yet
 
-- `agent:retry` handler (close PR, delete branch, clear in-flight) and the `pull_request: closed`
-  hook that clears `agent:in-flight`.
 - Flip draft PR to ready when CI is green.
 - Free-text follow-ups on a PR: locally this needs a verb (`agent:revise`) the next Run acts on, or
   the `@claude` mention workflow on Actions.

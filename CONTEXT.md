@@ -13,7 +13,9 @@ Vocabulary only. Implementation lives in the code and the ADRs.
 | **Brief** | The triage comment that is the Implement stage's contract for an Issue. |
 | **Verb label** | A label only a human sets to steer the runner: `agent:skip`, `agent:retry`, `agent:hold`. |
 | **Runner label** | A label only the runner sets: `agent:in-flight`, `agent-run`. |
-| **In-flight** | An Issue with a live agent PR. Not picked again until the PR closes. |
+| **In-flight** | An Issue with a live agent PR. Not picked again until the PR closes, unless it is a Continuation. |
+| **Continuation** | An Issue whose session hit the time cap with work committed. The next Run resumes its PR branch in a fresh session, first in the pick order. Capped by `max_continuations`, then handed to a human. |
+| **Cap** | The wall-clock limit of one session, by size label (`size:S`, `size:M`) or the default. The agent is told the cap and asked to open the PR before it. |
 | **Run Report** | The GitHub issue, labelled `agent-run`, that records one Run. The only durable record of a Run. |
 | **Budget gate** | The monthly cap (hours on a subscription token, dollars on an API key) past which the Implement stage does not start. |
 | **Stale PR** | An agent PR idle longer than `stale_days`. Listed under "Waiting on you", never auto-closed. |

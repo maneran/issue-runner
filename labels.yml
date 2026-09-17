@@ -24,5 +24,6 @@ verb:
   agent:hold:      {color: "fbca04", description: "HUMAN VERB: keep the PR, do not touch, do not nag"}
 runner:
   agent:in-flight: {color: "006b75", description: "RUNNER OWNED: an agent PR is open for this issue"}
+  agent:continue:  {color: "0e8a16", description: "RUNNER OWNED: the session hit its cap with work committed; the next Run resumes the PR"}
 report:
   agent-run:       {color: "0052cc", description: "RUNNER OWNED: a Run Report"}

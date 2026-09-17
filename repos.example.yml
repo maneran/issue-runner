@@ -6,7 +6,9 @@ repos:
     config:                        # same keys as examples/issue-runner.yml
       stages: []                   # [] = plan and report only; [triage, implement] = full Run
       quota: 0
-      per_issue_minutes: 30
+      per_issue_minutes: 45            # default cap; size labels override it below
+      minutes_by_size: {S: 20, M: 45, default: 45}
+      max_continuations: 3             # capped sessions on one issue before it goes ready-for-human
       triage_minutes: 20
       stale_days: 7
       models: {triage: claude-sonnet-5, implement: claude-opus-5}

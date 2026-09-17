@@ -22,6 +22,7 @@ from pathlib import Path
 import yaml
 
 from runner import cli
+from runner.usage import usage_from_transcripts
 
 HERE = Path(__file__).resolve().parent.parent
 WORKTREES = Path.home() / ".issue-runner" / "worktrees"
@@ -74,14 +75,20 @@ def claude_session(prompt: str, model: str, cwd: Path, minutes: int, claude_bin:
     return data
 
 
-def worktree(repo_path: Path, number: int, base_branch: str) -> Path:
+def worktree(repo_path: Path, number: int, base_branch: str, branch: str | None = None) -> Path:
+    """Fresh worktree at origin/<base_branch>, or on an existing agent branch when continuing."""
     wt = WORKTREES / repo_path.name / str(number)
     if wt.exists():
         sh(["git", "worktree", "remove", "--force", str(wt)], cwd=repo_path, check=False)
         shutil.rmtree(wt, ignore_errors=True)
     wt.parent.mkdir(parents=True, exist_ok=True)
-    sh(["git", "fetch", "origin", base_branch], cwd=repo_path)
-    sh(["git", "worktree", "add", "--detach", str(wt), f"origin/{base_branch}"], cwd=repo_path)
+    if branch:
+        sh(["git", "fetch", "origin", branch], cwd=repo_path)
+        sh(["git", "branch", "-f", branch, f"origin/{branch}"], cwd=repo_path)
+        sh(["git", "worktree", "add", str(wt), branch], cwd=repo_path)
+    else:
+        sh(["git", "fetch", "origin", base_branch], cwd=repo_path)
+        sh(["git", "worktree", "add", "--detach", str(wt), f"origin/{base_branch}"], cwd=repo_path)
     return wt
 
 
@@ -109,8 +116,11 @@ def run_repo(entry: dict, global_cfg: dict, quota_override: str | None, run_dir:
     if "triage" in cfg["stages"]:
         wt = worktree(repo_path, 0, cfg["base_branch"])
         try:
+            started = time.time()
             data = claude_session(render_prompt("triage.md", repo=slug), cfg["models"]["triage"], wt,
                                   cfg.get("triage_minutes", 20), claude_bin, allowed, run_dir / f"{name}-triage.log")
+            if data.get("total_cost_usd") is None:
+                data.update(usage_from_transcripts(str(wt), since=started))
             (results_dir / "triage").mkdir(exist_ok=True)
             moves = wt / "triage-moves.json"
             if moves.exists():
@@ -122,17 +132,30 @@ def run_repo(entry: dict, global_cfg: dict, quota_override: str | None, run_dir:
 
     for pick in plan["picked"]:
         n = pick["number"]
-        wt = worktree(repo_path, n, cfg["base_branch"])
+        minutes = int(pick.get("minutes") or cfg["per_issue_minutes"])
+        pr = pick.get("pr") or {}
+        wt = worktree(repo_path, n, cfg["base_branch"], branch=pr.get("headRefName") if pick.get("continue") else None)
         try:
-            data = claude_session(
-                render_prompt("implement.md", repo=slug, number=str(n), base_branch=cfg["base_branch"]),
-                cfg["models"]["implement"], wt, cfg["per_issue_minutes"], claude_bin, allowed,
-                run_dir / f"{name}-issue-{n}.log")
+            if pick.get("continue"):
+                prompt = render_prompt("continue.md", repo=slug, number=str(n), base_branch=cfg["base_branch"],
+                                       minutes=str(minutes), pr_number=str(pr.get("number", "")), branch=pr.get("headRefName", ""))
+            else:
+                prompt = render_prompt("implement.md", repo=slug, number=str(n), base_branch=cfg["base_branch"],
+                                       minutes=str(minutes))
+            started = time.time()
+            data = claude_session(prompt, cfg["models"]["implement"], wt, minutes, claude_bin, allowed,
+                                  run_dir / f"{name}-issue-{n}.log")
+            if data.get("total_cost_usd") is None:
+                data.update(usage_from_transcripts(str(wt), since=started))
             session_file = run_dir / f"{name}-issue-{n}.json"
             session_file.write_text(json.dumps(data))
-            cli.main(["result", "--repo", slug, "--number", str(n), "--execution-file", str(session_file),
-                      "--minutes", str(data["minutes"]), "--exit-code", "1" if data.get("is_error") else "0",
-                      "--in-flight-label", labels["in_flight"], "--out", str(results_dir / f"result-{n}.json")])
+            args = ["result", "--repo", slug, "--number", str(n), "--execution-file", str(session_file),
+                    "--minutes", str(data["minutes"]), "--exit-code", "1" if data.get("is_error") else "0",
+                    "--in-flight-label", labels["in_flight"], "--continue-label", labels["cont"],
+                    "--out", str(results_dir / f"result-{n}.json")]
+            if data.get("timed_out"):
+                args.append("--timed-out")
+            cli.main(args)
         finally:
             remove_worktree(repo_path, wt)
 
