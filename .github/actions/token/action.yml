@@ -1,0 +1,19 @@
+# GitHub App token when APP_ID + APP_PRIVATE_KEY are set (CI then runs on agent PRs);
+# otherwise the workflow's own token (fine for label sync and reports, PRs get no CI).
+name: token
+inputs:
+  app_id: {required: false}
+  private_key: {required: false}
+  fallback: {required: true}
+outputs:
+  token:
+    value: ${{ steps.app.outputs.token || inputs.fallback }}
+runs:
+  using: composite
+  steps:
+    - id: app
+      if: inputs.app_id != '' && inputs.private_key != ''
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ inputs.app_id }}
+        private-key: ${{ inputs.private_key }}

@@ -1,0 +1,28 @@
+# Canonical labels. Step 0 of every Run syncs these into the target repo
+# (create or update, never delete). A repo may rename a canonical key in its
+# config under `labels:`; the runner then uses the renamed string everywhere.
+state:
+  needs-triage:    {color: "e4e669", description: "Maintainer needs to evaluate this issue"}
+  needs-info:      {color: "d876e3", description: "Waiting on reporter for more information"}
+  ready-for-agent: {color: "0e8a16", description: "Fully specified, the runner may implement it"}
+  ready-for-human: {color: "1d76db", description: "Requires human implementation"}
+  wontfix:         {color: "ffffff", description: "Will not be actioned"}
+category:
+  bug:             {color: "d73a4a", description: "Something is broken"}
+  enhancement:     {color: "a2eeef", description: "New feature or improvement"}
+priority:
+  P0:              {color: "b60205", description: "Urgent: picked first"}
+  P1:              {color: "e99695", description: "Important"}
+  P2:              {color: "fef2c0", description: "Normal (default when no priority label)"}
+size:
+  size:S:          {color: "c2e0c6", description: "One file, one session"}
+  size:M:          {color: "bfd4f2", description: "A few files, one session"}
+  size:L:          {color: "f9d0c4", description: "Cross-cutting; triage splits it into sub-issues"}
+verb:
+  agent:skip:      {color: "000000", description: "HUMAN VERB: runner ignores this issue until removed"}
+  agent:retry:     {color: "5319e7", description: "HUMAN VERB: close the agent PR, delete its branch, pick again next Run"}
+  agent:hold:      {color: "fbca04", description: "HUMAN VERB: keep the PR, do not touch, do not nag"}
+runner:
+  agent:in-flight: {color: "006b75", description: "RUNNER OWNED: an agent PR is open for this issue"}
+report:
+  agent-run:       {color: "0052cc", description: "RUNNER OWNED: a Run Report"}

@@ -1,0 +1,24 @@
+# Copy to <target repo>/.github/workflows/issue-runner.yml
+name: issue-runner
+on:
+  schedule:
+    - cron: "0 4 * * *"            # 06:00 Israel (UTC+2/+3): the time "set by the admin" lives here
+  workflow_dispatch:
+    inputs:
+      quota:
+        description: "Override quota for this Run (0 = plan and report only)"
+        required: false
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+concurrency:
+  group: issue-runner-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  run:
+    uses: maneran/issue-runner/.github/workflows/run.yml@main
+    with:
+      quota: ${{ inputs.quota }}
+    secrets: inherit               # CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY; optional APP_ID + APP_PRIVATE_KEY

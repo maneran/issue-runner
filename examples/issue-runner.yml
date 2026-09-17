@@ -1,0 +1,13 @@
+# Copy to <target repo>/.github/issue-runner.yml
+stages: [triage, implement]        # [] disables both; the Run still syncs labels and reports
+quota: 2                           # issues the Implement stage takes per Run
+per_issue_minutes: 30              # wall-clock cap per issue (Actions timeout-minutes)
+stale_days: 7                      # agent PRs idle longer than this are listed under "Waiting on you"
+models:
+  triage: claude-sonnet-5
+  implement: claude-opus-5
+budget:                            # runner refuses the Implement stage past the cap for the month
+  hours_month: 25                  # used with a subscription token (Max plan)
+  usd_month: 150                   # used with an API key
+base_branch: main
+labels: {}                         # optional renames, e.g. {ready-for-agent: agent-ready}

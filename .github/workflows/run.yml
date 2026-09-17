@@ -1,0 +1,198 @@
+# Reusable workflow. Callers: see examples/caller.yml.
+name: issue-runner
+on:
+  workflow_call:
+    inputs:
+      config:
+        type: string
+        default: .github/issue-runner.yml
+      quota:
+        type: string
+        default: ""
+      runner_ref:
+        type: string
+        default: main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      picks: ${{ steps.plan.outputs.picks }}
+      count: ${{ steps.plan.outputs.count }}
+      report_number: ${{ steps.plan.outputs.report_number }}
+      run_triage: ${{ steps.plan.outputs.run_triage }}
+      per_issue_minutes: ${{ steps.plan.outputs.per_issue_minutes }}
+      model_triage: ${{ steps.plan.outputs.model_triage }}
+      model_implement: ${{ steps.plan.outputs.model_implement }}
+      base_branch: ${{ steps.plan.outputs.base_branch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: maneran/issue-runner
+          ref: ${{ inputs.runner_ref }}
+          path: .issue-runner
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q pyyaml
+      - id: token
+        uses: ./.issue-runner/.github/actions/token
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+          fallback: ${{ github.token }}
+      - id: plan
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PYTHONPATH: .issue-runner
+        run: python -m runner.cli plan --repo "$GITHUB_REPOSITORY" --config "${{ inputs.config }}" --quota "${{ inputs.quota }}" --out plan.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
+
+  triage:
+    needs: plan
+    if: needs.plan.outputs.run_triage == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: maneran/issue-runner
+          ref: ${{ inputs.runner_ref }}
+          path: .issue-runner
+      - id: token
+        uses: ./.issue-runner/.github/actions/token
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+          fallback: ${{ github.token }}
+      - id: prompt
+        run: |
+          {
+            echo "prompt<<EOF"
+            sed "s|{{repo}}|$GITHUB_REPOSITORY|g" .issue-runner/prompts/triage.md
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.token.outputs.token }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: --model ${{ needs.plan.outputs.model_triage }} --allowedTools "Bash(gh:*),Read,Glob,Grep,Write(triage-moves.json)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: triage
+          path: triage-moves.json
+          if-no-files-found: ignore
+
+  implement:
+    needs: plan
+    if: needs.plan.outputs.count > 0
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.per_issue_minutes) }}
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        issue: ${{ fromJSON(needs.plan.outputs.picks) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: maneran/issue-runner
+          ref: ${{ inputs.runner_ref }}
+          path: .issue-runner
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q pyyaml
+      - id: token
+        uses: ./.issue-runner/.github/actions/token
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+          fallback: ${{ github.token }}
+      - id: start
+        run: echo "t=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - id: prompt
+        run: |
+          {
+            echo "prompt<<EOF"
+            sed -e "s|{{repo}}|$GITHUB_REPOSITORY|g" \
+                -e "s|{{number}}|${{ matrix.issue.number }}|g" \
+                -e "s|{{base_branch}}|${{ needs.plan.outputs.base_branch }}|g" \
+                .issue-runner/prompts/implement.md
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - id: claude
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.token.outputs.token }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: --model ${{ needs.plan.outputs.model_implement }} --allowedTools "Bash,Read,Edit,Write,Glob,Grep,Agent"
+      - id: result
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PYTHONPATH: .issue-runner
+        run: |
+          mins=$(( ( $(date +%s) - ${{ steps.start.outputs.t }} ) / 60 ))
+          python -m runner.cli result --repo "$GITHUB_REPOSITORY" --number "${{ matrix.issue.number }}" \
+            --execution-file "${{ steps.claude.outputs.execution_file }}" --minutes "$mins" \
+            --exit-code "${{ steps.claude.outcome == 'success' && 0 || 1 }}" \
+            --out "result-${{ matrix.issue.number }}.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.issue.number }}
+          path: result-${{ matrix.issue.number }}.json
+
+  report:
+    needs: [plan, triage, implement]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: maneran/issue-runner
+          ref: ${{ inputs.runner_ref }}
+          path: .issue-runner
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q pyyaml
+      - uses: actions/download-artifact@v4
+        with:
+          path: results
+      - id: token
+        uses: ./.issue-runner/.github/actions/token
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+          fallback: ${{ github.token }}
+      - env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PYTHONPATH: .issue-runner
+        run: python -m runner.cli finalize --plan results/plan/plan.json --results-dir results
