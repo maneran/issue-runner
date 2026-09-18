@@ -164,3 +164,19 @@ def test_local_mode_refuses_api_key(monkeypatch):
         credential_kind()
     monkeypatch.delenv("ANTHROPIC_API_KEY")
     assert credential_kind() == "oauth"
+
+
+def test_due_once_per_day_after_schedule(tmp_path):
+    import time
+    from runner.loop import due
+
+    marker = tmp_path / "last"
+    sched = {"hour": 6, "minute": 0}
+    early = time.strptime("2026-09-18 05:59", "%Y-%m-%d %H:%M")
+    late = time.strptime("2026-09-18 06:00", "%Y-%m-%d %H:%M")
+    assert due(sched, marker, early) is False
+    assert due(sched, marker, late) is True
+    marker.write_text("2026-09-18")
+    assert due(sched, marker, late) is False
+    tomorrow = time.strptime("2026-09-19 09:30", "%Y-%m-%d %H:%M")
+    assert due(sched, marker, tomorrow) is True

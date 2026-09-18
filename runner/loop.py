@@ -35,6 +35,21 @@ DEFAULT_ALLOWED_TOOLS = [
 ]
 
 
+MARKER = Path.home() / ".issue-runner" / "last-run-date"
+
+
+def due(schedule: dict, marker: Path, now: time.struct_time | None = None) -> bool:
+    """True once per day, at the first tick at or after schedule.hour:minute local time.
+    launchd wakes us every few minutes (StartInterval); a closed laptop just runs at the
+    first tick after wake. The marker file holds the last date we ran."""
+    now = now or time.localtime()
+    today = time.strftime("%Y-%m-%d", now)
+    if marker.exists() and marker.read_text().strip() == today:
+        return False
+    hour, minute = int(schedule.get("hour", 6)), int(schedule.get("minute", 0))
+    return (now.tm_hour, now.tm_min) >= (hour, minute)
+
+
 def sh(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if check and proc.returncode != 0:
@@ -177,10 +192,17 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--config", default=str(HERE / "repos.yml"))
     p.add_argument("--only", default=None, help="path substring; run that repo only")
     p.add_argument("--quota", default=None)
+    p.add_argument("--tick", action="store_true",
+                   help="scheduler mode: run only if past today's schedule and not yet run today")
     args = p.parse_args(argv)
 
     os.environ["ISSUE_RUNNER_LOCAL"] = "1"
     global_cfg = yaml.safe_load(Path(args.config).read_text()) or {}
+    if args.tick and not due(global_cfg.get("schedule") or {}, MARKER):
+        return
+    if args.tick:
+        MARKER.parent.mkdir(parents=True, exist_ok=True)
+        MARKER.write_text(time.strftime("%Y-%m-%d"))
     run_dir = LOGS / time.strftime("%Y%m%d-%H%M")
     run_dir.mkdir(parents=True, exist_ok=True)
     failures = 0

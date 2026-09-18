@@ -22,8 +22,14 @@ secondary and untested past quota 0.
 python3 -m venv .venv && .venv/bin/pip install pytest pyyaml
 cp repos.example.yml repos.yml          # add repos, set schedule, stages, quota, budget
 PYTHONPATH=. .venv/bin/python -m runner.loop --quota 0     # smoke: labels + empty Run Report
-scripts/install-launchd.sh              # daily job at repos.yml schedule; prints run-now/remove
+scripts/install-launchd.sh              # launchd ticks every 15 min; the loop runs once a day at repos.yml's schedule
 ```
+
+Scheduling: launchd `StartInterval` wakes `runner.loop --tick` every 15 minutes (`TICK=` to change);
+the loop runs the day's Run at the first tick at or after `schedule` and records the date in
+`~/.issue-runner/last-run-date`. A closed laptop runs at the first tick after wake. launchd's
+`StartCalendarInterval` and cron were both tried: the calendar trigger never fired on macOS 26 and
+`crontab` needs Full Disk Access, which an agent host should not have.
 
 Each Claude session runs `claude -p` in a throwaway git worktree under `~/.issue-runner/worktrees`,
 never in the admin's checkout, with the tool allow-list from the config. Logs per Run in
