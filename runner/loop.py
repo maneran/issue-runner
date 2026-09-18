@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import yaml
@@ -38,16 +39,22 @@ DEFAULT_ALLOWED_TOOLS = [
 MARKER = Path.home() / ".issue-runner" / "last-run-date"
 
 
-def due(schedule: dict, marker: Path, now: time.struct_time | None = None) -> bool:
-    """True once per day, at the first tick at or after schedule.hour:minute local time.
-    launchd wakes us every few minutes (StartInterval); a closed laptop just runs at the
-    first tick after wake. The marker file holds the last date we ran."""
+def slot_date(schedule: dict, now: time.struct_time | None = None) -> str:
+    """Date of the latest scheduled time at or before now: today's if the clock has passed
+    schedule.hour:minute, else yesterday's."""
     now = now or time.localtime()
-    today = time.strftime("%Y-%m-%d", now)
-    if marker.exists() and marker.read_text().strip() == today:
-        return False
     hour, minute = int(schedule.get("hour", 6)), int(schedule.get("minute", 0))
-    return (now.tm_hour, now.tm_min) >= (hour, minute)
+    day = date(now.tm_year, now.tm_mon, now.tm_mday)
+    if (now.tm_hour, now.tm_min) < (hour, minute):
+        day -= timedelta(days=1)
+    return day.isoformat()
+
+
+def due(schedule: dict, marker: Path, now: time.struct_time | None = None) -> bool:
+    """True once per scheduled slot, at the first tick at or after schedule.hour:minute local time.
+    launchd wakes us every few minutes (StartInterval); a closed laptop just runs at the first
+    tick after wake, even when that is past midnight. The marker file holds the last slot served."""
+    return not (marker.exists() and marker.read_text().strip() == slot_date(schedule, now))
 
 
 def sh(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -198,22 +205,28 @@ def main(argv: list[str] | None = None) -> None:
 
     os.environ["ISSUE_RUNNER_LOCAL"] = "1"
     global_cfg = yaml.safe_load(Path(args.config).read_text()) or {}
-    if args.tick and not due(global_cfg.get("schedule") or {}, MARKER):
+    schedule = global_cfg.get("schedule") or {}
+    if args.tick and not due(schedule, MARKER):
         return
-    if args.tick:
+    if args.tick:  # claim the slot first so a tick landing mid-Run does not start a second one
         MARKER.parent.mkdir(parents=True, exist_ok=True)
-        MARKER.write_text(time.strftime("%Y-%m-%d"))
+        MARKER.write_text(slot_date(schedule))
     run_dir = LOGS / time.strftime("%Y%m%d-%H%M")
     run_dir.mkdir(parents=True, exist_ok=True)
-    failures = 0
+    attempted = failures = 0
     for entry in global_cfg.get("repos", []):
         if args.only and args.only not in entry["path"]:
             continue
+        attempted += 1
         try:
             run_repo(entry, global_cfg, args.quota, run_dir)
         except Exception as e:  # one repo failing must not stop the others
             failures += 1
             print(f"!! {entry['path']}: {e}", file=sys.stderr)
+    # Every Claude session leaves a .log in run_dir, so none there means every repo failed
+    # before its first session (gh auth, missing claude, network): cheap to retry next tick.
+    if args.tick and attempted and failures == attempted and not any(run_dir.glob("*.log")):
+        MARKER.unlink(missing_ok=True)
     print(f"logs: {run_dir}")
     sys.exit(1 if failures else 0)
 

@@ -26,8 +26,9 @@ scripts/install-launchd.sh              # launchd ticks every 15 min; the loop r
 ```
 
 Scheduling: launchd `StartInterval` wakes `runner.loop --tick` every 15 minutes (`TICK=` to change);
-the loop runs the day's Run at the first tick at or after `schedule` and records the date in
-`~/.issue-runner/last-run-date`. A closed laptop runs at the first tick after wake. launchd's
+the loop runs the day's Run at the first tick at or after `schedule` and records that slot's date in
+`~/.issue-runner/last-run-date`. A closed laptop runs at the first tick after wake, even past midnight.
+If every repo fails before its first Claude session, the marker is cleared and the next tick retries. launchd's
 `StartCalendarInterval` and cron were both tried: the calendar trigger never fired on macOS 26 and
 `crontab` needs Full Disk Access, which an agent host should not have.
 

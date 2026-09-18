@@ -168,15 +168,71 @@ def test_local_mode_refuses_api_key(monkeypatch):
 
 def test_due_once_per_day_after_schedule(tmp_path):
     import time
-    from runner.loop import due
+    from runner.loop import due, slot_date
 
     marker = tmp_path / "last"
     sched = {"hour": 6, "minute": 0}
     early = time.strptime("2026-09-18 05:59", "%Y-%m-%d %H:%M")
     late = time.strptime("2026-09-18 06:00", "%Y-%m-%d %H:%M")
+    marker.write_text("2026-09-17")
     assert due(sched, marker, early) is False
     assert due(sched, marker, late) is True
-    marker.write_text("2026-09-18")
+    marker.write_text(slot_date(sched, late))
+    assert marker.read_text() == "2026-09-18"
     assert due(sched, marker, late) is False
     tomorrow = time.strptime("2026-09-19 09:30", "%Y-%m-%d %H:%M")
     assert due(sched, marker, tomorrow) is True
+
+
+def test_due_serves_missed_slot_after_midnight(tmp_path):
+    import time
+    from runner.loop import due, slot_date
+
+    marker = tmp_path / "last"
+    # Laptop closed at 05:00, opened after midnight: yesterday's 06:00 slot is still owed.
+    marker.write_text("2026-09-17")
+    after_midnight = time.strptime("2026-09-19 00:10", "%Y-%m-%d %H:%M")
+    sched = {"hour": 6, "minute": 0}
+    assert slot_date(sched, after_midnight) == "2026-09-18"
+    assert due(sched, marker, after_midnight) is True
+    marker.write_text(slot_date(sched, after_midnight))
+    assert due(sched, marker, after_midnight) is False
+    # A late schedule with 15-minute ticks: the 00:05 tick still serves the 23:55 slot.
+    late = {"hour": 23, "minute": 55}
+    marker.write_text("2026-09-17")
+    tick = time.strptime("2026-09-19 00:05", "%Y-%m-%d %H:%M")
+    assert slot_date(late, tick) == "2026-09-18"
+    assert due(late, marker, tick) is True
+
+
+def test_tick_clears_marker_only_when_every_repo_fails_before_a_session(tmp_path, monkeypatch):
+    import pytest
+    from runner import loop
+
+    monkeypatch.setattr(loop, "MARKER", tmp_path / "last")
+    monkeypatch.setattr(loop, "LOGS", tmp_path / "logs")
+    cfg = tmp_path / "repos.yml"
+    cfg.write_text("schedule: {hour: 0, minute: 0}\nrepos:\n  - path: /a\n  - path: /b\n")
+
+    def boom(entry, *_):
+        raise RuntimeError("gh: not logged in")
+    monkeypatch.setattr(loop, "run_repo", boom)
+    with pytest.raises(SystemExit):
+        loop.main(["--tick", "--config", str(cfg)])
+    assert not loop.MARKER.exists()  # next tick retries
+
+    def boom_after_session(entry, global_cfg, quota, run_dir):
+        (run_dir / "a-issue-1.log").write_text("")
+        raise RuntimeError("finalize failed")
+    monkeypatch.setattr(loop, "run_repo", boom_after_session)
+    with pytest.raises(SystemExit):
+        loop.main(["--tick", "--config", str(cfg)])
+    assert loop.MARKER.exists()  # a session ran: do not spend more hours on this slot
+
+    loop.MARKER.unlink()
+    ran = []
+    monkeypatch.setattr(loop, "run_repo", lambda entry, *_: ran.append(entry["path"]) if entry["path"] == "/a" else boom(entry))
+    with pytest.raises(SystemExit):
+        loop.main(["--tick", "--config", str(cfg)])
+    assert ran == ["/a"]
+    assert loop.MARKER.read_text() == loop.slot_date({"hour": 0, "minute": 0})  # one repo ran: slot served
