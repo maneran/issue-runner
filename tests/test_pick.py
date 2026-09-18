@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from datetime import datetime, timezone
 
 from runner.pick import select_picks, budget_used, ReportTotals
@@ -236,3 +237,62 @@ def test_tick_clears_marker_only_when_every_repo_fails_before_a_session(tmp_path
         loop.main(["--tick", "--config", str(cfg)])
     assert ran == ["/a"]
     assert loop.MARKER.read_text() == loop.slot_date({"hour": 0, "minute": 0})  # one repo ran: slot served
+
+
+def test_reconcile_closes_issue_when_agent_pr_merged(monkeypatch):
+    from runner import cli
+
+    calls = []
+
+    def fake_gh(*args, input=None):
+        calls.append(args)
+        return ""
+
+    def fake_agent_pr(repo, n, state="open"):
+        return {"url": "https://x/pr/9"} if state == "merged" else None
+
+    monkeypatch.setattr(cli, "gh", fake_gh)
+    monkeypatch.setattr(cli, "agent_pr", fake_agent_pr)
+    labels = {"ready": "ready-for-agent", "in_flight": "agent:in-flight", "cont": "agent:continue",
+              "retry": "agent:retry", "human": "ready-for-human"}
+    issues = [issue(5, ["ready-for-agent", "agent:in-flight"])]
+    handoffs = cli.reconcile_verbs("o/r", issues, labels, reports=[], max_continuations=3)
+    assert any(c[:2] == ("issue", "close") for c in calls)
+    assert handoffs == [(5, "closed: agent PR merged (https://x/pr/9)")]
+    assert {l["name"] for l in issues[0]["labels"]} == set()
+
+
+def test_quota_three_one_pick_fails_others_still_run_and_finalize(tmp_path, monkeypatch):
+    from runner import loop
+
+    picks = [{"number": 1, "title": "a", "url": "u"}, {"number": 2, "title": "b", "url": "u"}, {"number": 3, "title": "c", "url": "u"}]
+    calls = []
+
+    def fake_cli_main(argv):
+        calls.append(argv[0])
+        if argv[0] == "plan":
+            out = argv[argv.index("--out") + 1]
+            Path(out).write_text(json.dumps({"picked": picks, "labels": {"in_flight": "agent:in-flight", "cont": "agent:continue"}}))
+        elif argv[0] == "result":
+            n = int(argv[argv.index("--number") + 1])
+            if n == 2:
+                raise SystemExit("gh pr list failed")  # what cli.gh raises
+            Path(argv[argv.index("--out") + 1]).write_text(json.dumps({"number": n, "status": "pr_opened"}))
+
+    sessions = []
+    monkeypatch.setattr(loop.cli, "main", fake_cli_main)
+    monkeypatch.setattr(loop, "repo_slug", lambda p: "o/r")
+    monkeypatch.setattr(loop, "worktree", lambda *a, **k: tmp_path / "wt")
+    monkeypatch.setattr(loop, "remove_worktree", lambda *a: None)
+    monkeypatch.setattr(loop, "record_usage", lambda *a: None)
+    monkeypatch.setattr(loop, "render_prompt", lambda *a, **k: "prompt")
+    monkeypatch.setattr(loop, "claude_session", lambda *a, **k: sessions.append(1) or {"minutes": 1.0})
+
+    run_dir = tmp_path / "run"
+    loop.run_repo({"path": str(tmp_path), "config": {"stages": ["implement"], "quota": 3}}, {}, None, run_dir)
+
+    assert len(sessions) == 3, "every pick got a session"
+    assert calls[-1] == "finalize"
+    results = sorted(p.name for p in (run_dir / f"{tmp_path.name}-results").glob("result-*.json"))
+    assert results == ["result-1.json", "result-2.json", "result-3.json"]
+    assert json.loads((run_dir / f"{tmp_path.name}-results" / "result-2.json").read_text())["status"] == "failed"

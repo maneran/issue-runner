@@ -163,35 +163,49 @@ def run_repo(entry: dict, global_cfg: dict, quota_override: str | None, run_dir:
         finally:
             remove_worktree(repo_path, wt)
 
-    for pick in plan["picked"]:
-        n = pick["number"]
-        minutes = int(pick.get("minutes") or cfg["per_issue_minutes"])
-        pr = pick.get("pr") or {}
-        wt = worktree(repo_path, n, cfg["base_branch"], branch=pr.get("headRefName") if pick.get("continue") else None)
-        try:
-            if pick.get("continue"):
-                prompt = render_prompt("continue.md", repo=slug, number=str(n), base_branch=cfg["base_branch"],
-                                       minutes=str(minutes), pr_number=str(pr.get("number", "")), branch=pr.get("headRefName", ""))
-            else:
-                prompt = render_prompt("implement.md", repo=slug, number=str(n), base_branch=cfg["base_branch"],
-                                       minutes=str(minutes))
-            started = time.time()
-            data = claude_session(prompt, cfg["models"]["implement"], wt, minutes, claude_bin, allowed,
-                                  run_dir / f"{name}-issue-{n}.log")
-            record_usage(data, wt, started, cfg)
-            session_file = run_dir / f"{name}-issue-{n}.json"
-            session_file.write_text(json.dumps(data))
-            args = ["result", "--repo", slug, "--number", str(n), "--execution-file", str(session_file),
-                    "--minutes", str(data["minutes"]), "--exit-code", "1" if data.get("is_error") else "0",
-                    "--in-flight-label", labels["in_flight"], "--continue-label", labels["cont"],
-                    "--out", str(results_dir / f"result-{n}.json")]
-            if data.get("timed_out"):
-                args.append("--timed-out")
-            cli.main(args)
-        finally:
-            remove_worktree(repo_path, wt)
+    try:
+        for pick in plan["picked"]:
+            n = pick["number"]
+            try:
+                implement_one(pick, cfg, slug, repo_path, run_dir, results_dir, labels, claude_bin, allowed)
+            except (Exception, SystemExit) as e:  # one pick failing must not strand the others
+                print(f"!! {slug}#{n}: {e}", file=sys.stderr)
+                (results_dir / f"result-{n}.json").write_text(json.dumps(
+                    {"number": n, "status": "failed", "error": str(e)[:500]}))
+    finally:
+        cli.main(["finalize", "--plan", str(plan_file), "--results-dir", str(results_dir)])
 
-    cli.main(["finalize", "--plan", str(plan_file), "--results-dir", str(results_dir)])
+
+def implement_one(pick: dict, cfg: dict, slug: str, repo_path: Path, run_dir: Path, results_dir: Path,
+                  labels: dict, claude_bin: str, allowed: list[str]) -> None:
+    """One Implement session for one pick: worktree, claude -p, result labels. Always removes the worktree."""
+    n = pick["number"]
+    name = repo_path.name
+    minutes = int(pick.get("minutes") or cfg["per_issue_minutes"])
+    pr = pick.get("pr") or {}
+    wt = worktree(repo_path, n, cfg["base_branch"], branch=pr.get("headRefName") if pick.get("continue") else None)
+    try:
+        if pick.get("continue"):
+            prompt = render_prompt("continue.md", repo=slug, number=str(n), base_branch=cfg["base_branch"],
+                                   minutes=str(minutes), pr_number=str(pr.get("number", "")), branch=pr.get("headRefName", ""))
+        else:
+            prompt = render_prompt("implement.md", repo=slug, number=str(n), base_branch=cfg["base_branch"],
+                                   minutes=str(minutes))
+        started = time.time()
+        data = claude_session(prompt, cfg["models"]["implement"], wt, minutes, claude_bin, allowed,
+                              run_dir / f"{name}-issue-{n}.log")
+        record_usage(data, wt, started, cfg)
+        session_file = run_dir / f"{name}-issue-{n}.json"
+        session_file.write_text(json.dumps(data))
+        args = ["result", "--repo", slug, "--number", str(n), "--execution-file", str(session_file),
+                "--minutes", str(data["minutes"]), "--exit-code", "1" if data.get("is_error") else "0",
+                "--in-flight-label", labels["in_flight"], "--continue-label", labels["cont"],
+                "--out", str(results_dir / f"result-{n}.json")]
+        if data.get("timed_out"):
+            args.append("--timed-out")
+        cli.main(args)
+    finally:
+        remove_worktree(repo_path, wt)
 
 
 def main(argv: list[str] | None = None) -> None:

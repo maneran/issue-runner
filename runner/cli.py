@@ -331,6 +331,14 @@ def reconcile_verbs(repo: str, issues: list[dict], labels: dict, reports: list[d
                 if lab in names:
                     gh("issue", "edit", "--repo", repo, str(n), "--remove-label", lab)
                     names.discard(lab)
+            merged = agent_pr(repo, n, state="merged")
+            if merged:
+                # GitHub closes on "Closes #n" only when the PR lands on the default branch.
+                # A merge anywhere else would leave the issue ready-for-agent and picked again.
+                gh("issue", "close", "--repo", repo, str(n), "--comment",
+                   f"> *issue-runner:* closed because {merged['url']} was merged.")
+                handoffs.append((n, f"closed: agent PR merged ({merged['url']})"))
+                names.discard(labels["ready"])
 
         if labels["cont"] in names and continuation_count(reports, n) >= max_continuations:
             gh("issue", "comment", "--repo", repo, str(n), "--body",
