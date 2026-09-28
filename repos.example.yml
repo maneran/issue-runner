@@ -16,3 +16,18 @@ repos:
       show_api_equivalent: false       # true adds a "what this would cost on the API" figure; never a bill
       base_branch: develop
       # allowed_tools: [...]       # override the loop's default allow-list for claude -p
+      setup:                       # run in each fresh worktree before the session: its own env from the lockfiles
+        - uv venv -q --python 3.11 .venv
+        - uv pip install -q --python .venv/bin/python -r requirements.txt
+        - uv pip install -q --python .venv/bin/python --no-deps -r requirements-nodeps.txt
+        - cd ui && npm ci --prefer-offline --no-audit --no-fund --loglevel=error
+      env:                         # CI's test placeholders, for the session's commands
+        # Lowercase on purpose: pydantic-settings matches either case, while Claude Code reads only
+        # ANTHROPIC_API_KEY, which the loop strips so the session stays on the subscription.
+        anthropic_api_key: test-placeholder
+        # A closed port: tests that need Postgres or Redis fail fast (CI runs them) instead of
+        # reaching the docker dev stack on 5432/6379. The sandbox blocks localhost too.
+        database_url: postgresql://none:none@127.0.0.1:1/none
+        redis_url: redis://127.0.0.1:1
+        supabase_url: https://placeholder.supabase.co
+        encryption_key: dGVzdC1rZXktMzItYnl0ZXMtZm9yLWNpLXRlc3Rpbmc=  # CI's test key, not a secret

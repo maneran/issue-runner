@@ -3,9 +3,10 @@
   python -m runner.loop --config repos.yml [--only <path substring>] [--quota N]
 
 Each Claude session runs `claude -p` inside a throwaway git worktree, so the
-admin's own checkout and uncommitted work are never touched. Tool access is the
-allow-list in the repo config (`allowed_tools`); anything outside it is denied,
-not prompted, because there is nobody at the keyboard.
+admin's own checkout and uncommitted work are never touched. Bash commands run in
+Claude Code's OS-level sandbox (see `sandbox_settings`) and are auto-allowed there;
+every other tool call needs the allow-list (`allowed_tools`). Anything outside both
+is denied, not prompted, because there is nobody at the keyboard.
 """
 
 from __future__ import annotations
@@ -29,31 +30,46 @@ HERE = Path(__file__).resolve().parent.parent
 WORKTREES = Path.home() / ".issue-runner" / "worktrees"
 LOGS = Path.home() / "Library" / "Logs" / "issue-runner"
 
-DEFAULT_ALLOWED_TOOLS = [
-    "Read", "Edit", "Write", "Glob", "Grep", "Agent",
-    "Bash(git:*)", "Bash(gh:*)", "Bash(pytest:*)",
-    "Bash(.venv/bin/pytest:*)", "Bash(.venv/bin/ruff:*)", "Bash(.venv/bin/mypy:*)",
-    "Bash(.venv/bin/python -m mypy:*)",
-    "Bash(.venv/bin/python -m scripts.seed_templates --validate-only:*)",
-    "Bash(.venv/bin/python -m scripts.seed_widget_molds --validate-only:*)",
-    "Bash(pre-commit run:*)",
-    "Bash(ruff:*)", "Bash(npm:*)", "Bash(python:*)", "Bash(python3:*)",
-]
+# Bare "Bash" is safe only because of the sandbox: with allowUnsandboxedCommands off, every
+# command runs inside it except one that is wholly a SANDBOX_EXCLUDED command (a compound such
+# as `gh ... && cat x` stays sandboxed), and DENIED_TOOLS refuses the risky forms of those.
+# Without it, loops, pipes and redirects are refused even inside the sandbox.
+DEFAULT_ALLOWED_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "Agent", "Bash"]
 
-# Heavy, untracked dirs from the admin's checkout, symlinked into each worktree so the
-# repo's own commands (`.venv/bin/pytest`, `cd ui && npm run lint`) work unchanged.
-# The repo must git-ignore the bare names: a `.venv/` pattern does not match a symlink.
-SHARED_DIRS = (".venv", "ui/node_modules")
-
-# Always denied; deny wins over any allow. The shared dirs belong to the admin's checkout,
-# so the session may read them but never change them.
+# Always denied; deny wins over any allow. gh runs unsandboxed with the admin's login, so
+# the subcommands that can send arbitrary data or change the account are refused outright.
 DENIED_TOOLS = [
     "Bash(docker:*)", "Read(**/.env)",
-    "Bash(pip:*)", "Bash(pip3:*)", "Bash(.venv/bin/pip:*)", "Bash(.venv/bin/pip3:*)",
-    "Bash(python -m pip:*)", "Bash(python3 -m pip:*)", "Bash(.venv/bin/python -m pip:*)",
-    "Bash(npm install:*)", "Bash(npm i:*)", "Bash(npm ci:*)", "Bash(npm uninstall:*)", "Bash(npm update:*)",
-    "Edit(.venv/**)", "Write(.venv/**)", "Edit(ui/node_modules/**)", "Write(ui/node_modules/**)",
+    "Bash(gh api:*)", "Bash(gh gist:*)", "Bash(gh secret:*)", "Bash(gh variable:*)",
+    "Bash(gh auth:*)", "Bash(gh ssh-key:*)", "Bash(gh gpg-key:*)", "Bash(gh extension:*)",
+    "Bash(gh alias:*)", "Bash(gh repo create:*)", "Bash(gh repo delete:*)", "Bash(gh repo edit:*)",
+    "Bash(gh release:*)", "Bash(gh workflow:*)", "Bash(gh pr merge:*)",
 ]
+
+# Go's TLS check fails under the macOS sandbox (gh), and git needs the keychain to push or
+# fetch; the sandbox blocks the keychain. These run outside it, gated by the rules above.
+SANDBOX_EXCLUDED = ["gh *", "git push *", "git fetch *", "git pull *", "git ls-remote *"]
+# Package registries only. GitHub traffic is gh and git, which run outside the sandbox, so
+# sandboxed code has no route to GitHub.
+SANDBOX_DOMAINS = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
+
+
+def sandbox_settings(repo_path: Path) -> dict:
+    """OS-level limits on every sandboxed Bash command and its children. Writes: the worktree,
+    its cache dir and a temp dir only. Reads: not the admin's checkouts (their parent dir; the
+    worktree needs only the shared .git), not credentials, not any .env. Network: the package
+    registries only. No unsandboxed retry, and no session at all if the sandbox is down."""
+    return {"sandbox": {
+        "enabled": True, "failIfUnavailable": True,
+        "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
+        "excludedCommands": SANDBOX_EXCLUDED,
+        "filesystem": {
+            "denyRead": [str(repo_path.parent), "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.docker",
+                         "~/.config/gh", "~/Library/Keychains", "~/**/.env"],
+            "allowRead": [str(repo_path / ".git")],
+        },
+        "network": {"strictAllowlist": True, "allowedDomains": SANDBOX_DOMAINS},
+    }}
 
 
 MARKER = Path.home() / ".issue-runner" / "last-run-date"
@@ -96,21 +112,21 @@ def render_prompt(name: str, **vars: str) -> str:
 
 
 def claude_session(prompt: str, model: str, cwd: Path, minutes: int, claude_bin: str,
-                   allowed_tools: list[str], log: Path) -> dict:
+                   allowed_tools: list[str], log: Path, repo_path: Path, test_env: dict) -> dict:
     """One non-interactive Claude Code session. Returns the parsed JSON result
     (total_cost_usd, usage, duration_ms, is_error) or a synthetic error dict."""
+    cache = cache_dir(cwd)
+    cache.mkdir(exist_ok=True)
+    # The built-in file tools are not sandboxed, so they get the same read and write fence.
+    denied = DENIED_TOOLS + [f"Read(/{repo_path.parent}/**)", f"Edit(/{repo_path.parent}/**)"]
     cmd = [claude_bin, "-p", prompt, "--model", model, "--output-format", "json",
-           "--allowedTools", ",".join(allowed_tools)]
-    denied = list(DENIED_TOOLS)
-    for rel in SHARED_DIRS:
-        if (cwd / rel).is_symlink():
-            target = (cwd / rel).resolve()
-            denied += [f"Edit(/{target}/**)", f"Write(/{target}/**)"]
-            if rel == ".venv":  # readable, so the interpreter's own files resolve; never the repo root
-                cmd += ["--add-dir", str(target)]
-    cmd += ["--disallowedTools", ",".join(denied)]
+           "--settings", json.dumps(sandbox_settings(repo_path)), "--add-dir", str(cache),
+           "--allowedTools", ",".join(allowed_tools), "--disallowedTools", ",".join(denied)]
+    # The session's own package caches: whatever it installs never reaches the admin's shared ones.
+    env = {**os.environ, **test_env,
+           "UV_CACHE_DIR": str(cache / "uv"), "npm_config_cache": str(cache / "npm"), "PIP_CACHE_DIR": str(cache / "pip")}
     # Subscription only: an exported API key must never reach the session.
-    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    env = {k: v for k, v in env.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     started = time.time()
     try:
         proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=minutes * 60)
@@ -137,12 +153,17 @@ def record_usage(data: dict, wt: Path, started: float, cfg: dict) -> None:
         data["cost_source"] = "subscription"
 
 
-def worktree(repo_path: Path, number: int, base_branch: str, branch: str | None = None) -> Path:
+def cache_dir(wt: Path) -> Path:
+    return wt.with_name(wt.name + ".cache")
+
+
+def worktree(repo_path: Path, number: int, base_branch: str, setup: list[str], branch: str | None = None) -> Path:
     """Fresh worktree at origin/<base_branch>, or on an existing agent branch when continuing."""
     wt = WORKTREES / repo_path.name / str(number)
     if wt.exists():
         sh(["git", "worktree", "remove", "--force", str(wt)], cwd=repo_path, check=False)
         shutil.rmtree(wt, ignore_errors=True)
+    shutil.rmtree(cache_dir(wt), ignore_errors=True)
     wt.parent.mkdir(parents=True, exist_ok=True)
     if branch:
         sh(["git", "fetch", "origin", branch], cwd=repo_path)
@@ -151,19 +172,19 @@ def worktree(repo_path: Path, number: int, base_branch: str, branch: str | None 
     else:
         sh(["git", "fetch", "origin", base_branch], cwd=repo_path)
         sh(["git", "worktree", "add", "--detach", str(wt), f"origin/{base_branch}"], cwd=repo_path)
-    link_shared_dirs(repo_path, wt)
+    # The repo's `setup` from repos.yml builds its own .venv, node_modules and the like from the
+    # lockfiles. Admin config, so it runs outside the sandbox and uses the shared download caches.
+    for step in setup:
+        proc = subprocess.run(["bash", "-c", step], cwd=wt, capture_output=True, text=True)
+        if proc.returncode != 0:
+            remove_worktree(repo_path, wt)
+            raise RuntimeError(f"setup `{step}` failed:\n{proc.stderr.strip()[-2000:]}")
     return wt
-
-
-def link_shared_dirs(repo_path: Path, wt: Path) -> None:
-    for rel in SHARED_DIRS:
-        src, dst = repo_path / rel, wt / rel
-        if src.is_dir() and dst.parent.is_dir() and not dst.exists():
-            dst.symlink_to(src)
 
 
 def remove_worktree(repo_path: Path, wt: Path) -> None:
     sh(["git", "worktree", "remove", "--force", str(wt)], cwd=repo_path, check=False)
+    shutil.rmtree(cache_dir(wt), ignore_errors=True)
 
 
 def run_repo(entry: dict, global_cfg: dict, quota_override: str | None, run_dir: Path) -> None:
@@ -184,11 +205,12 @@ def run_repo(entry: dict, global_cfg: dict, quota_override: str | None, run_dir:
     labels = plan["labels"]
 
     if "triage" in cfg["stages"]:
-        wt = worktree(repo_path, 0, cfg["base_branch"])
+        wt = worktree(repo_path, 0, cfg["base_branch"], cfg.get("setup", []))
         try:
             started = time.time()
             data = claude_session(render_prompt("triage.md", repo=slug), cfg["models"]["triage"], wt,
-                                  cfg.get("triage_minutes", 20), claude_bin, allowed, run_dir / f"{name}-triage.log")
+                                  cfg.get("triage_minutes", 20), claude_bin, allowed, run_dir / f"{name}-triage.log",
+                                  repo_path, cfg.get("env", {}))
             record_usage(data, wt, started, cfg)
             (results_dir / "triage").mkdir(exist_ok=True)
             moves = wt / "triage-moves.json"
@@ -219,7 +241,8 @@ def implement_one(pick: dict, cfg: dict, slug: str, repo_path: Path, run_dir: Pa
     name = repo_path.name
     minutes = int(pick.get("minutes") or cfg["per_issue_minutes"])
     pr = pick.get("pr") or {}
-    wt = worktree(repo_path, n, cfg["base_branch"], branch=pr.get("headRefName") if pick.get("continue") else None)
+    wt = worktree(repo_path, n, cfg["base_branch"], cfg.get("setup", []),
+                  branch=pr.get("headRefName") if pick.get("continue") else None)
     try:
         if pick.get("continue"):
             prompt = render_prompt("continue.md", repo=slug, number=str(n), base_branch=cfg["base_branch"],
@@ -229,7 +252,7 @@ def implement_one(pick: dict, cfg: dict, slug: str, repo_path: Path, run_dir: Pa
                                    minutes=str(minutes))
         started = time.time()
         data = claude_session(prompt, cfg["models"]["implement"], wt, minutes, claude_bin, allowed,
-                              run_dir / f"{name}-issue-{n}.log")
+                              run_dir / f"{name}-issue-{n}.log", repo_path, cfg.get("env", {}))
         record_usage(data, wt, started, cfg)
         session_file = run_dir / f"{name}-issue-{n}.json"
         session_file.write_text(json.dumps(data))
