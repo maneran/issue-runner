@@ -31,8 +31,28 @@ LOGS = Path.home() / "Library" / "Logs" / "issue-runner"
 
 DEFAULT_ALLOWED_TOOLS = [
     "Read", "Edit", "Write", "Glob", "Grep", "Agent",
-    "Bash(git:*)", "Bash(gh:*)", "Bash(pytest:*)", "Bash(.venv/bin/*)",
+    "Bash(git:*)", "Bash(gh:*)", "Bash(pytest:*)",
+    "Bash(.venv/bin/pytest:*)", "Bash(.venv/bin/ruff:*)", "Bash(.venv/bin/mypy:*)",
+    "Bash(.venv/bin/python -m mypy:*)",
+    "Bash(.venv/bin/python -m scripts.seed_templates --validate-only:*)",
+    "Bash(.venv/bin/python -m scripts.seed_widget_molds --validate-only:*)",
+    "Bash(pre-commit run:*)",
     "Bash(ruff:*)", "Bash(npm:*)", "Bash(python:*)", "Bash(python3:*)",
+]
+
+# Heavy, untracked dirs from the admin's checkout, symlinked into each worktree so the
+# repo's own commands (`.venv/bin/pytest`, `cd ui && npm run lint`) work unchanged.
+# The repo must git-ignore the bare names: a `.venv/` pattern does not match a symlink.
+SHARED_DIRS = (".venv", "ui/node_modules")
+
+# Always denied; deny wins over any allow. The shared dirs belong to the admin's checkout,
+# so the session may read them but never change them.
+DENIED_TOOLS = [
+    "Bash(docker:*)", "Read(**/.env)",
+    "Bash(pip:*)", "Bash(pip3:*)", "Bash(.venv/bin/pip:*)", "Bash(.venv/bin/pip3:*)",
+    "Bash(python -m pip:*)", "Bash(python3 -m pip:*)", "Bash(.venv/bin/python -m pip:*)",
+    "Bash(npm install:*)", "Bash(npm i:*)", "Bash(npm ci:*)", "Bash(npm uninstall:*)", "Bash(npm update:*)",
+    "Edit(.venv/**)", "Write(.venv/**)", "Edit(ui/node_modules/**)", "Write(ui/node_modules/**)",
 ]
 
 
@@ -81,6 +101,14 @@ def claude_session(prompt: str, model: str, cwd: Path, minutes: int, claude_bin:
     (total_cost_usd, usage, duration_ms, is_error) or a synthetic error dict."""
     cmd = [claude_bin, "-p", prompt, "--model", model, "--output-format", "json",
            "--allowedTools", ",".join(allowed_tools)]
+    denied = list(DENIED_TOOLS)
+    for rel in SHARED_DIRS:
+        if (cwd / rel).is_symlink():
+            target = (cwd / rel).resolve()
+            denied += [f"Edit(/{target}/**)", f"Write(/{target}/**)"]
+            if rel == ".venv":  # readable, so the interpreter's own files resolve; never the repo root
+                cmd += ["--add-dir", str(target)]
+    cmd += ["--disallowedTools", ",".join(denied)]
     # Subscription only: an exported API key must never reach the session.
     env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
     started = time.time()
@@ -123,7 +151,15 @@ def worktree(repo_path: Path, number: int, base_branch: str, branch: str | None 
     else:
         sh(["git", "fetch", "origin", base_branch], cwd=repo_path)
         sh(["git", "worktree", "add", "--detach", str(wt), f"origin/{base_branch}"], cwd=repo_path)
+    link_shared_dirs(repo_path, wt)
     return wt
+
+
+def link_shared_dirs(repo_path: Path, wt: Path) -> None:
+    for rel in SHARED_DIRS:
+        src, dst = repo_path / rel, wt / rel
+        if src.is_dir() and dst.parent.is_dir() and not dst.exists():
+            dst.symlink_to(src)
 
 
 def remove_worktree(repo_path: Path, wt: Path) -> None:
