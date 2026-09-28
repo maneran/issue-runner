@@ -215,6 +215,18 @@ def test_tick_clears_marker_only_when_every_repo_fails_before_a_session(tmp_path
     cfg = tmp_path / "repos.yml"
     cfg.write_text("schedule: {hour: 0, minute: 0}\nrepos:\n  - path: /a\n  - path: /b\n")
 
+    def no_token():
+        raise RuntimeError("no GitHub token")
+    monkeypatch.setattr(loop, "github_env", no_token)
+    alerts = []
+    monkeypatch.setattr(loop, "notify", alerts.append)
+    with pytest.raises(SystemExit):
+        loop.main(["--tick", "--config", str(cfg)])
+    assert not loop.MARKER.exists()  # no token: the slot is not claimed, next tick retries
+    assert alerts == ["no GitHub token"]
+    monkeypatch.setattr(loop, "github_env", lambda: {})
+    monkeypatch.setattr(loop, "token_notice", lambda: None)
+
     def boom(entry, *_):
         raise RuntimeError("gh: not logged in")
     monkeypatch.setattr(loop, "run_repo", boom)

@@ -153,6 +153,8 @@ def report_body(plan: dict, results: list[dict] | None = None) -> str:
         f"quota {cfg['quota']} · cap {cfg['per_issue_minutes']} min/issue · "
         f"status: **{plan.get('status', 'running')}**",
     ]
+    if plan.get("notice"):
+        lines.append(f"\n> **Action needed:** {plan['notice']}")
     if plan.get("gate"):
         lines.append(f"\n> Implement stage skipped: {plan['gate']}")
     lines.append(f"\n## Picked ({len(plan['picked'])})\n")
@@ -279,6 +281,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
         "repo": repo, "started_at": now.strftime("%Y-%m-%d %H:%M"), "credential": kind,
         "config": cfg, "labels": labels, "picked": picked, "skipped": skipped, "gate": gate,
         "stale_prs": stale_prs(repo, cfg["stale_days"], now), "status": "running",
+        "notice": os.environ.get("ISSUE_RUNNER_NOTICE"),
     }
     url = gh("issue", "create", "--repo", repo, "--label", labels["report"],
              "--title", report_title(plan), "--body", report_body(plan)).strip()

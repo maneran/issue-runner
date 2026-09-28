@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,29 +37,40 @@ LOGS = Path.home() / "Library" / "Logs" / "issue-runner"
 # Without it, loops, pipes and redirects are refused even inside the sandbox.
 DEFAULT_ALLOWED_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "Agent", "Bash"]
 
-# Always denied; deny wins over any allow. gh runs unsandboxed with the admin's login, so
+# Always denied; deny wins over any allow. gh runs unsandboxed with the runner's token, so
 # the subcommands that can send arbitrary data or change the account are refused outright.
+# The .venv is the admin's, shared by symlink: no installs into it, no edits under it.
 DENIED_TOOLS = [
     "Bash(docker:*)", "Read(**/.env)",
+    "Bash(pip:*)", "Bash(pip3:*)", "Bash(.venv/bin/pip:*)", "Bash(.venv/bin/pip3:*)", "Bash(uv:*)",
+    "Bash(python -m pip:*)", "Bash(python3 -m pip:*)", "Bash(.venv/bin/python -m pip:*)",
+    "Edit(.venv/**)", "Write(.venv/**)",
     "Bash(gh api:*)", "Bash(gh gist:*)", "Bash(gh secret:*)", "Bash(gh variable:*)",
     "Bash(gh auth:*)", "Bash(gh ssh-key:*)", "Bash(gh gpg-key:*)", "Bash(gh extension:*)",
     "Bash(gh alias:*)", "Bash(gh repo create:*)", "Bash(gh repo delete:*)", "Bash(gh repo edit:*)",
     "Bash(gh release:*)", "Bash(gh workflow:*)", "Bash(gh pr merge:*)",
 ]
 
-# Go's TLS check fails under the macOS sandbox (gh), and git needs the keychain to push or
-# fetch; the sandbox blocks the keychain. These run outside it, gated by the rules above.
+# Go's TLS check fails under the macOS sandbox (gh), and git needs github.com, which the
+# sandbox's network allow-list leaves out. These run outside it, gated by the rules above.
 SANDBOX_EXCLUDED = ["gh *", "git push *", "git fetch *", "git pull *", "git ls-remote *"]
-# Package registries only. GitHub traffic is gh and git, which run outside the sandbox, so
-# sandboxed code has no route to GitHub.
-SANDBOX_DOMAINS = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
+# npm only; no PyPI, so nothing pip-installs. GitHub traffic is gh and git, which run outside
+# the sandbox, so sandboxed code has no route to GitHub.
+SANDBOX_DOMAINS = ["registry.npmjs.org"]
+
+# The runner's own fine-grained token, scoped to its repos. Read at launch; never the admin's gh login.
+KEYCHAIN_SERVICE = "issue-runner-github"
+TOKEN_WARN_DAYS = 14
+TOKEN_ALERTED = Path.home() / ".issue-runner" / "token-alert-date"
+REPLACE_TOKEN = (f"Make a new token (README, Local setup), then run `security delete-generic-password -s {KEYCHAIN_SERVICE}` "
+                 f"and `security add-generic-password -a \"$USER\" -s {KEYCHAIN_SERVICE} -w`.")
 
 
 def sandbox_settings(repo_path: Path) -> dict:
     """OS-level limits on every sandboxed Bash command and its children. Writes: the worktree,
     its cache dir and a temp dir only. Reads: not the admin's checkouts (their parent dir; the
-    worktree needs only the shared .git), not credentials, not any .env. Network: the package
-    registries only. No unsandboxed retry, and no session at all if the sandbox is down."""
+    worktree needs only the shared .git and the shared .venv), not credentials, not any .env.
+    Network: the npm registry only. No unsandboxed retry, and no session at all if the sandbox is down."""
     return {"sandbox": {
         "enabled": True, "failIfUnavailable": True,
         "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
@@ -66,7 +78,7 @@ def sandbox_settings(repo_path: Path) -> dict:
         "filesystem": {
             "denyRead": [str(repo_path.parent), "~/.ssh", "~/.aws", "~/.gnupg", "~/.netrc", "~/.docker",
                          "~/.config/gh", "~/Library/Keychains", "~/**/.env"],
-            "allowRead": [str(repo_path / ".git")],
+            "allowRead": [str(repo_path / ".git"), str(repo_path / ".venv")],
         },
         "network": {"strictAllowlist": True, "allowedDomains": SANDBOX_DOMAINS},
     }}
@@ -153,6 +165,49 @@ def record_usage(data: dict, wt: Path, started: float, cfg: dict) -> None:
         data["cost_source"] = "subscription"
 
 
+def github_env() -> dict:
+    """GH_TOKEN for gh, and a git credential helper for HTTPS that answers with it. Env only:
+    the admin's gh login and git config stay untouched. The empty helper first drops the
+    admin's helpers (osxkeychain), so git neither uses their login nor stores this token."""
+    proc = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+                          capture_output=True, text=True)
+    token = proc.stdout.strip()
+    if proc.returncode != 0 or not token:
+        raise RuntimeError(f"no GitHub token in the Keychain under service {KEYCHAIN_SERVICE!r}")
+    helper = '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'
+    return {"GH_TOKEN": token, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "credential.https://github.com.helper", "GIT_CONFIG_VALUE_0": "",
+            "GIT_CONFIG_KEY_1": "credential.https://github.com.helper", "GIT_CONFIG_VALUE_1": helper}
+
+
+def token_notice(today: date | None = None) -> str | None:
+    """A warning when the token expires within TOKEN_WARN_DAYS; RuntimeError when GitHub rejects it.
+    GitHub states the expiry in a response header. Any other gh failure (offline) is left to the Run."""
+    proc = subprocess.run(["gh", "api", "--include", "rate_limit"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        if "401" in proc.stderr or "Bad credentials" in proc.stderr:
+            raise RuntimeError(f"GitHub rejected the runner's token (expired or revoked). {REPLACE_TOKEN}")
+        return None
+    m = re.search(r"(?im)^github-authentication-token-expiration:\s*(\d{4}-\d{2}-\d{2})", proc.stdout)
+    if not m:
+        return None
+    left = (date.fromisoformat(m.group(1)) - (today or date.today())).days
+    if left > TOKEN_WARN_DAYS:
+        return None
+    return f"The runner's GitHub token expires on {m.group(1)} ({left} days). {REPLACE_TOKEN}"
+
+
+def notify(message: str) -> None:
+    """macOS notification, at most once a day: a failing tick retries every 15 minutes."""
+    today = date.today().isoformat()
+    if TOKEN_ALERTED.exists() and TOKEN_ALERTED.read_text().strip() == today:
+        return
+    TOKEN_ALERTED.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_ALERTED.write_text(today)
+    subprocess.run(["osascript", "-e", f"display notification {json.dumps(message)} with title \"issue-runner\""],
+                   capture_output=True)
+
+
 def cache_dir(wt: Path) -> Path:
     return wt.with_name(wt.name + ".cache")
 
@@ -172,8 +227,12 @@ def worktree(repo_path: Path, number: int, base_branch: str, setup: list[str], b
     else:
         sh(["git", "fetch", "origin", base_branch], cwd=repo_path)
         sh(["git", "worktree", "add", "--detach", str(wt), f"origin/{base_branch}"], cwd=repo_path)
-    # The repo's `setup` from repos.yml builds its own .venv, node_modules and the like from the
-    # lockfiles. Admin config, so it runs outside the sandbox and uses the shared download caches.
+    # The admin's .venv, so `.venv/bin/pytest` works unchanged. The repo must ignore the bare name
+    # (.git/info/exclude): a `.venv/` pattern does not match a symlink.
+    if (repo_path / ".venv").is_dir():
+        (wt / ".venv").symlink_to(repo_path / ".venv")
+    # The repo's `setup` from repos.yml (node_modules and the like). Admin config, so it runs
+    # outside the sandbox and uses the shared download caches.
     for step in setup:
         proc = subprocess.run(["bash", "-c", step], cwd=wt, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -281,6 +340,15 @@ def main(argv: list[str] | None = None) -> None:
     schedule = global_cfg.get("schedule") or {}
     if args.tick and not due(schedule, MARKER):
         return
+    try:  # before claiming the slot: a missing or rejected token is retried next tick
+        os.environ.update(github_env())
+        notice = token_notice()
+    except RuntimeError as e:
+        notify(str(e))
+        sys.exit(f"!! {e}")
+    if notice:  # the Run Report shows it; cli reads the env like ISSUE_RUNNER_LOCAL
+        notify(notice)
+        os.environ["ISSUE_RUNNER_NOTICE"] = notice
     if args.tick:  # claim the slot first so a tick landing mid-Run does not start a second one
         MARKER.parent.mkdir(parents=True, exist_ok=True)
         MARKER.write_text(slot_date(schedule))

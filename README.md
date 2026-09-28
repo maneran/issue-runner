@@ -21,6 +21,7 @@ secondary and untested past quota 0.
 ```
 python3 -m venv .venv && .venv/bin/pip install pytest pyyaml
 cp repos.example.yml repos.yml          # add repos, set schedule, stages, quota, budget
+security add-generic-password -a "$USER" -s issue-runner-github -w   # prompts for the runner's GitHub token
 PYTHONPATH=. .venv/bin/python -m runner.loop --quota 0     # smoke: labels + empty Run Report
 scripts/install-launchd.sh              # launchd ticks every 15 min; the loop runs once a day at repos.yml's schedule
 ```
@@ -31,6 +32,13 @@ the loop runs the day's Run at the first tick at or after `schedule` and records
 If every repo fails before its first Claude session, the marker is cleared and the next tick retries. launchd's
 `StartCalendarInterval` and cron were both tried: the calendar trigger never fired on macOS 26 and
 `crontab` needs Full Disk Access, which an agent host should not have.
+
+GitHub access: a fine-grained token scoped to the runner's repos, read from the Keychain at launch
+(service `issue-runner-github`). The loop hands it to gh as `GH_TOKEN` and to git as an HTTPS
+credential helper, through its own environment only; your gh login and git config stay as they are.
+No token, no Run: a tick without one exits and the next tick retries. Before each Run the loop reads
+the token's expiry from GitHub: within 14 days of it, the Run Report opens with an "Action needed"
+line, and a missing, rejected or expiring token raises a macOS notification (at most once a day).
 
 Each Claude session runs `claude -p` in a throwaway git worktree under `~/.issue-runner/worktrees`,
 never in the admin's checkout, with the tool allow-list from the config. Logs per Run in

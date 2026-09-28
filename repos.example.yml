@@ -16,10 +16,7 @@ repos:
       show_api_equivalent: false       # true adds a "what this would cost on the API" figure; never a bill
       base_branch: develop
       # allowed_tools: [...]       # override the loop's default allow-list for claude -p
-      setup:                       # run in each fresh worktree before the session: its own env from the lockfiles
-        - uv venv -q --python 3.11 .venv
-        - uv pip install -q --python .venv/bin/python -r requirements.txt
-        - uv pip install -q --python .venv/bin/python --no-deps -r requirements-nodeps.txt
+      setup:                       # run in each fresh worktree before the session (the checkout's .venv is symlinked in)
         - cd ui && npm ci --prefer-offline --no-audit --no-fund --loglevel=error
       env:                         # CI's test placeholders, for the session's commands
         # Lowercase on purpose: pydantic-settings matches either case, while Claude Code reads only
