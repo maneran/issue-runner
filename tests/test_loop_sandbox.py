@@ -15,6 +15,7 @@ def test_sandbox_fences_the_checkouts_and_every_env_file():
     assert box["filesystem"]["allowRead"] == ["/Users/admin/Development/app/.git", "/Users/admin/Development/app/.venv"]
     assert "pypi.org" not in box["network"]["allowedDomains"]
     assert box["network"]["strictAllowlist"] is True
+    assert {"name": "GH_TOKEN", "mode": "deny"} in box["credentials"]["envVars"]
 
 
 def test_session_never_gets_an_api_key(tmp_path, monkeypatch):

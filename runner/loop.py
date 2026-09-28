@@ -81,6 +81,9 @@ def sandbox_settings(repo_path: Path) -> dict:
             "allowRead": [str(repo_path / ".git"), str(repo_path / ".venv")],
         },
         "network": {"strictAllowlist": True, "allowedDomains": SANDBOX_DOMAINS},
+        # Unset for sandboxed commands only: gh and git push run outside the sandbox and keep it.
+        # Otherwise any sandboxed code could write the token to a file that the next push publishes.
+        "credentials": {"envVars": [{"name": "GH_TOKEN", "mode": "deny"}]},
     }}
 
 
